@@ -1,4 +1,4 @@
-mail"""
+"""
 Command Line Interface for CacheXSSDetector.
 Handles all CLI commands and options using Click.
 """
