@@ -1,218 +1,192 @@
 """
-URL Path Manipulation Module for CacheXSSDetector.
-Handles generation and manipulation of URL paths for testing cache-based XSS vulnerabilities.
+Optimized URL Path Manipulation Module for CacheXSSDetector.
+Handles efficient generation and manipulation of URL paths for testing cache-based XSS vulnerabilities.
 """
 
-from typing import List, Set
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+from typing import List, Set, Generator, Dict, Optional
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
 import itertools
 from ..utils.logger import get_logger
+from functools import lru_cache
 
 logger = get_logger(__name__)
 
 class URLManipulator:
     """
-    Handles URL manipulation and variation generation for testing.
+    Optimized URL manipulation with smart variation generation and caching.
     """
     
-    def __init__(self):
-        """Initialize URL Manipulator with common test patterns."""
+    def __init__(self, max_variations: int = 100):
+        """
+        Initialize URL Manipulator with optimized test patterns.
+        
+        Args:
+            max_variations (int): Maximum number of variations to generate per URL
+        """
+        self.max_variations = max_variations
+        
+        # Optimized path patterns focusing on cache-relevant variations
         self.path_patterns = [
             "/",
             "/*",
             "/*/",
             "//",
             "/./",
-            "/../",
-            "/.../",
             "%2f",
-            "%2F",
         ]
         
+        # Reduced parameter patterns focusing on effective variations
         self.param_patterns = [
             "",
             "*",
-            "*/",
             "../",
-            "..%2f",
             "%2e%2e%2f",
-            "%252e%252e%252f",
         ]
         
+        # Cache-related headers for reference
         self.cache_headers = [
             "X-Cache",
             "X-Cache-Hit",
-            "X-Cached",
             "CF-Cache-Status",
             "Age",
             "Cache-Control",
-            "Expires",
         ]
+        
+        # Initialize variation cache
+        self._variation_cache = lru_cache(maxsize=1000)(self._generate_variations_uncached)
 
     def generate_variations(self, url: str) -> List[str]:
         """
-        Generate various URL permutations for testing.
+        Generate optimized URL permutations for testing.
         
         Args:
             url (str): Base URL to generate variations from
             
         Returns:
-            List[str]: List of URL variations
+            List[str]: List of unique, relevant URL variations
         """
         try:
-            parsed = urlparse(url)
-            variations: Set[str] = {url}  # Use set to avoid duplicates
+            # Normalize URL first
+            normalized_url = self.normalize_url(url)
             
-            # Extract base components
-            base = f"{parsed.scheme}://{parsed.netloc}"
-            path = parsed.path
-            params = parse_qs(parsed.query)
+            # Use cached generation if available
+            variations = self._variation_cache(normalized_url)
             
-            # Generate path variations
-            path_parts = [p for p in path.split('/') if p]
-            path_variations = self._generate_path_variations(path_parts)
-            
-            # Add path variations to results
-            for path_var in path_variations:
-                if parsed.query:
-                    variations.add(f"{base}{path_var}?{parsed.query}")
-                else:
-                    variations.add(f"{base}{path_var}")
-            
-            # Generate parameter variations
-            if params:
-                param_variations = self._generate_param_variations(params)
-                for param_var in param_variations:
-                    variations.add(f"{base}{path}?{param_var}")
-            
-            # Add cache-buster variations
-            variations.update(self._add_cache_busters(url))
-            
-            logger.debug(f"Generated {len(variations)} URL variations for {url}")
-            return list(variations)
+            # Log generation statistics
+            logger.debug(f"Generated {len(variations)} variations for {url}")
+            return variations
             
         except Exception as e:
             logger.error(f"Error generating URL variations: {str(e)}")
             return [url]
 
-    def _generate_path_variations(self, path_parts: List[str]) -> Set[str]:
+    def _generate_variations_uncached(self, url: str) -> List[str]:
         """
-        Generate variations of the URL path.
+        Internal method to generate variations without caching.
         
         Args:
-            path_parts (List[str]): Parts of the URL path
+            url (str): Normalized URL to generate variations from
             
         Returns:
-            Set[str]: Set of path variations
+            List[str]: List of variations
         """
-        variations: Set[str] = set()
+        variations: Set[str] = {url}
+        parsed = urlparse(url)
         
-        try:
-            # Generate variations for each path segment
-            for i in range(len(path_parts) + 1):
-                current_parts = path_parts[:i]
-                
-                # Add basic path
-                base_path = '/' + '/'.join(current_parts)
-                variations.add(base_path)
-                
-                # Add path pattern variations
-                for pattern in self.path_patterns:
-                    var_path = base_path + pattern
-                    variations.add(var_path)
-                    
-                    # Add encoded variations
-                    variations.add(var_path.replace('/', '%2f'))
-                    variations.add(var_path.replace('/', '%2F'))
-                
-                # Add double-encoding variations
-                if i > 0:
-                    double_encoded = base_path.replace('/', '%252f')
-                    variations.add(double_encoded)
+        # Extract components
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path or "/"
+        params = parse_qs(parsed.query)
+        
+        # Generate path variations efficiently
+        path_variations = self._generate_path_variations(path)
+        
+        # Add path variations within limits
+        for path_var in itertools.islice(path_variations, self.max_variations // 2):
+            if parsed.query:
+                variations.add(f"{base}{path_var}?{parsed.query}")
+            else:
+                variations.add(f"{base}{path_var}")
             
-            return variations
+            if len(variations) >= self.max_variations:
+                break
+        
+        # Generate parameter variations if space allows
+        if params and len(variations) < self.max_variations:
+            param_variations = self._generate_param_variations(params)
+            remaining_slots = self.max_variations - len(variations)
             
-        except Exception as e:
-            logger.error(f"Error generating path variations: {str(e)}")
-            return {'/'}
+            for param_var in itertools.islice(param_variations, remaining_slots):
+                variations.add(f"{base}{path}?{param_var}")
+        
+        # Convert to list and apply final limit
+        return list(variations)[:self.max_variations]
 
-    def _generate_param_variations(self, params: dict) -> Set[str]:
+    def _generate_path_variations(self, path: str) -> Generator[str, None, None]:
         """
-        Generate variations of URL parameters.
+        Generate optimized path variations using a generator.
         
         Args:
-            params (dict): Original URL parameters
+            path (str): Original URL path
             
-        Returns:
-            Set[str]: Set of parameter variations
+        Yields:
+            str: Path variation
         """
-        variations: Set[str] = set()
+        # Split path into components
+        path_parts = [p for p in path.split('/') if p]
         
-        try:
-            # Generate variations for each parameter
-            for param_name in params:
-                # Original parameter value
-                orig_value = params[param_name][0]
-                
-                # Add basic parameter variations
-                for pattern in self.param_patterns:
-                    new_params = params.copy()
-                    new_params[param_name] = [orig_value + pattern]
-                    variations.add(urlencode(new_params, doseq=True))
-                    
-                    # Add encoded variations
-                    encoded_value = orig_value.replace('/', '%2f')
-                    new_params[param_name] = [encoded_value + pattern]
-                    variations.add(urlencode(new_params, doseq=True))
-                
-                # Add cache-buster parameter
+        # Base path variations
+        yield path
+        yield path.rstrip('/') + '/'
+        
+        # Generate variations for each path segment
+        for i in range(len(path_parts) + 1):
+            current_parts = path_parts[:i]
+            base_path = '/' + '/'.join(current_parts)
+            
+            # Yield basic variations
+            yield base_path
+            
+            # Add selected pattern variations
+            for pattern in self.path_patterns:
+                yield base_path + pattern
+            
+            # Add selective encoding variations
+            if i > 0:
+                yield base_path.replace('/', '%2f')
+
+    def _generate_param_variations(self, params: Dict) -> Generator[str, None, None]:
+        """
+        Generate optimized parameter variations using a generator.
+        
+        Args:
+            params (Dict): Original URL parameters
+            
+        Yields:
+            str: Parameter variation
+        """
+        # Original parameters
+        yield urlencode(params, doseq=True)
+        
+        # Generate variations for each parameter
+        for param_name in params:
+            orig_value = params[param_name][0]
+            
+            # Basic parameter variations
+            for pattern in self.param_patterns:
                 new_params = params.copy()
-                new_params['_'] = ['1234567890']
-                variations.add(urlencode(new_params, doseq=True))
+                new_params[param_name] = [orig_value + pattern]
+                yield urlencode(new_params, doseq=True)
             
-            return variations
-            
-        except Exception as e:
-            logger.error(f"Error generating parameter variations: {str(e)}")
-            return {urlencode(params, doseq=True)}
+            # Add cache buster with timestamp
+            new_params = params.copy()
+            new_params['_'] = ['timestamp']
+            yield urlencode(new_params, doseq=True)
 
-    def _add_cache_busters(self, url: str) -> Set[str]:
+    @staticmethod
+    def normalize_url(url: str) -> str:
         """
-        Add cache-busting parameters to URLs.
-        
-        Args:
-            url (str): Original URL
-            
-        Returns:
-            Set[str]: Set of URLs with cache-busting parameters
-        """
-        variations: Set[str] = set()
-        
-        try:
-            parsed = urlparse(url)
-            params = parse_qs(parsed.query)
-            
-            # Add timestamp cache buster
-            params['_ts'] = ['1234567890']
-            variations.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params, doseq=True)}")
-            
-            # Add random cache buster
-            params['_r'] = ['abc123']
-            variations.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params, doseq=True)}")
-            
-            # Add version cache buster
-            params['_v'] = ['1.0']
-            variations.add(f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params, doseq=True)}")
-            
-            return variations
-            
-        except Exception as e:
-            logger.error(f"Error adding cache busters: {str(e)}")
-            return {url}
-
-    def normalize_url(self, url: str) -> str:
-        """
-        Normalize a URL by removing redundant slashes, resolving relative paths, etc.
+        Normalize a URL by removing redundant components and standardizing format.
         
         Args:
             url (str): URL to normalize
@@ -221,6 +195,7 @@ class URLManipulator:
             str: Normalized URL
         """
         try:
+            # Parse URL
             parsed = urlparse(url)
             
             # Normalize scheme
@@ -233,16 +208,23 @@ class URLManipulator:
             path = parsed.path
             while '//' in path:
                 path = path.replace('//', '/')
+            if not path:
+                path = '/'
             
             # Normalize query parameters
             params = parse_qs(parsed.query)
             normalized_query = urlencode(sorted(params.items()), doseq=True) if params else ''
             
             # Reconstruct URL
-            normalized = f"{scheme}://{host}{path}"
-            if normalized_query:
-                normalized += f"?{normalized_query}"
-                
+            normalized = urlunparse((
+                scheme,
+                host,
+                path,
+                '',  # params
+                normalized_query,
+                ''   # fragment
+            ))
+            
             return normalized
             
         except Exception as e:
@@ -273,11 +255,49 @@ class URLManipulator:
             logger.error(f"Error comparing URL origins: {str(e)}")
             return False
 
+    def get_variation_info(self, url: str) -> Dict:
+        """
+        Get information about potential variations for a URL.
+        
+        Args:
+            url (str): URL to analyze
+            
+        Returns:
+            Dict: Information about potential variations
+        """
+        try:
+            parsed = urlparse(url)
+            
+            return {
+                'scheme': parsed.scheme,
+                'netloc': parsed.netloc,
+                'path_segments': len([p for p in parsed.path.split('/') if p]),
+                'query_params': len(parse_qs(parsed.query)),
+                'potential_variations': min(
+                    self.max_variations,
+                    len(self.path_patterns) * (len([p for p in parsed.path.split('/') if p]) + 1) +
+                    len(self.param_patterns) * len(parse_qs(parsed.query))
+                ),
+                'normalized_url': self.normalize_url(url)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing URL: {str(e)}")
+            return {'error': str(e)}
+
 if __name__ == "__main__":
     # Test URL manipulator functionality
-    manipulator = URLManipulator()
+    manipulator = URLManipulator(max_variations=50)
     test_url = "http://example.com/path/to/resource?param=value"
+    
+    # Generate and print variations
     variations = manipulator.generate_variations(test_url)
     print(f"Generated {len(variations)} variations for {test_url}")
     for var in variations:
         print(f"- {var}")
+    
+    # Print variation info
+    info = manipulator.get_variation_info(test_url)
+    print("\nVariation Info:")
+    for key, value in info.items():
+        print(f"{key}: {value}")
