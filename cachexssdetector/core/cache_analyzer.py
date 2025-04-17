@@ -1,37 +1,50 @@
 """
-Cache Behavior Analysis Engine for CacheXSSDetector.
-Analyzes cache behavior patterns to identify potential vulnerabilities.
+Enhanced Cache Behavior Analysis Engine for CacheXSSDetector.
+Optimized analyzer with improved performance and reliability.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import asyncio
 import time
 import hashlib
+from functools import lru_cache
 from ..utils.logger import get_logger
 from ..request.http_client import HTTPClient
 
 logger = get_logger(__name__)
 
-@dataclass
+@dataclass(frozen=True)
 class CacheInfo:
-    """Data class for storing cache analysis results."""
+    """Enhanced data class for storing cache analysis results."""
     is_cached: bool
-    cache_headers: Dict[str, str]
-    cache_control: Dict[str, str]
+    cache_headers: Tuple[Tuple[str, str], ...]
+    cache_control: Tuple[Tuple[str, str], ...]
     ttl: Optional[int]
-    vary_headers: List[str]
-    cache_key_components: List[str]
+    vary_headers: Tuple[str, ...]
+    cache_key_components: Tuple[str, ...]
     timestamp: str = datetime.now().isoformat()
+    response_time: Optional[float] = None
+    status_code: Optional[int] = None
+    cache_hit_ratio: Optional[float] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert cache info to dictionary."""
+        return asdict(self)
 
 class CacheAnalyzer:
     """
-    Analyzes cache behavior of web applications to identify potential vulnerabilities.
+    Optimized cache behavior analyzer with improved performance and reliability.
     """
 
-    def __init__(self):
-        """Initialize Cache Analyzer with default settings."""
+    def __init__(self, cache_size: int = 1000):
+        """
+        Initialize Cache Analyzer with optimized settings.
+        
+        Args:
+            cache_size (int): Size of LRU cache for analysis results
+        """
         self.cache_headers = [
             "X-Cache",
             "X-Cache-Hit",
@@ -55,10 +68,19 @@ class CacheAnalyzer:
             "proxy-revalidate",
             "immutable"
         ]
+        
+        # Initialize cache and concurrency control
+        self._cache = {}
+        self._cache_size = cache_size
+        self._analysis_semaphore = asyncio.Semaphore(10)
+
+    def _create_immutable_dict(self, d: Dict) -> Tuple[Tuple[str, str], ...]:
+        """Convert dictionary to immutable tuple of tuples."""
+        return tuple(sorted((str(k), str(v)) for k, v in d.items()))
 
     async def analyze(self, client: HTTPClient, url: str) -> CacheInfo:
         """
-        Analyze cache behavior for a given URL.
+        Analyze cache behavior with optimized request handling.
         
         Args:
             client (HTTPClient): HTTP client instance
@@ -68,55 +90,94 @@ class CacheAnalyzer:
             CacheInfo: Analysis results
         """
         try:
-            # Perform initial request
-            response1 = await client.get(url)
-            headers1 = response1.headers
-            
-            # Extract cache headers
-            cache_headers = self._extract_cache_headers(headers1)
-            cache_control = self._parse_cache_control(headers1.get('Cache-Control', ''))
-            vary_headers = self._parse_vary_headers(headers1.get('Vary', ''))
-            
-            # Determine if response is cacheable
-            is_cached = self._is_response_cached(headers1)
-            ttl = self._calculate_ttl(headers1)
-            
-            # Analyze cache key components
-            cache_key_components = self._analyze_cache_key_components(headers1)
-            
-            # Perform cache validation tests
-            await self._validate_cache_behavior(client, url, headers1)
-            
-            return CacheInfo(
-                is_cached=is_cached,
-                cache_headers=cache_headers,
-                cache_control=cache_control,
-                ttl=ttl,
-                vary_headers=vary_headers,
-                cache_key_components=cache_key_components
-            )
-            
+            async with self._analysis_semaphore:
+                start_time = time.time()
+                
+                # Check cache first
+                cache_key = self._generate_cache_key(url)
+                if cached_result := self._get_cached_result(cache_key):
+                    logger.debug(f"Cache hit for analysis of {url}")
+                    return cached_result
+                
+                # Perform initial request with timing
+                response = await client.get(
+                    url,
+                    headers={'Cache-Control': 'no-cache'},
+                    use_cache=False
+                )
+                
+                response_time = time.time() - start_time
+                
+                # Extract and analyze headers
+                headers = dict(response.headers)
+                cache_headers = self._extract_cache_headers(headers)
+                cache_control = self._parse_cache_control(headers.get('Cache-Control', ''))
+                vary_headers = self._parse_vary_headers(headers.get('Vary', ''))
+                
+                # Determine cacheability
+                is_cached = self._is_response_cached(headers)
+                ttl = self._calculate_ttl(headers)
+                
+                # Analyze cache key components
+                cache_key_components = self._analyze_cache_key_components(headers)
+                
+                # Perform quick cache validation
+                cache_hit_ratio = await self._quick_cache_check(client, url)
+                
+                # Convert dictionaries to immutable types
+                immutable_cache_headers = self._create_immutable_dict(cache_headers)
+                immutable_cache_control = self._create_immutable_dict(cache_control)
+                immutable_vary_headers = tuple(sorted(vary_headers))
+                immutable_cache_key_components = tuple(sorted(cache_key_components))
+                
+                result = CacheInfo(
+                    is_cached=is_cached,
+                    cache_headers=immutable_cache_headers,
+                    cache_control=immutable_cache_control,
+                    ttl=ttl,
+                    vary_headers=immutable_vary_headers,
+                    cache_key_components=immutable_cache_key_components,
+                    response_time=response_time,
+                    status_code=response.status,
+                    cache_hit_ratio=cache_hit_ratio
+                )
+                
+                # Cache the result
+                self._cache_result(cache_key, result)
+                
+                return result
+                
         except Exception as e:
             logger.error(f"Cache analysis failed for {url}: {str(e)}")
             return CacheInfo(
                 is_cached=False,
-                cache_headers={},
-                cache_control={},
+                cache_headers=(),
+                cache_control=(),
                 ttl=None,
-                vary_headers=[],
-                cache_key_components=[]
+                vary_headers=(),
+                cache_key_components=(),
+                status_code=None,
+                cache_hit_ratio=0.0
             )
 
+    def _generate_cache_key(self, url: str) -> str:
+        """Generate a unique cache key for analysis results."""
+        return hashlib.md5(url.encode()).hexdigest()
+
+    def _get_cached_result(self, cache_key: str) -> Optional[CacheInfo]:
+        """Get cached analysis result."""
+        return self._cache.get(cache_key)
+
+    def _cache_result(self, cache_key: str, result: CacheInfo) -> None:
+        """Cache analysis result with LRU eviction."""
+        if len(self._cache) >= self._cache_size:
+            # Remove oldest entry
+            oldest_key = next(iter(self._cache))
+            del self._cache[oldest_key]
+        self._cache[cache_key] = result
+
     def _extract_cache_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
-        """
-        Extract relevant cache-related headers.
-        
-        Args:
-            headers (Dict[str, str]): Response headers
-            
-        Returns:
-            Dict[str, str]: Cache-related headers
-        """
+        """Extract cache-related headers efficiently."""
         return {
             header: headers[header]
             for header in self.cache_headers
@@ -124,15 +185,7 @@ class CacheAnalyzer:
         }
 
     def _parse_cache_control(self, cache_control: str) -> Dict[str, str]:
-        """
-        Parse Cache-Control header into components.
-        
-        Args:
-            cache_control (str): Cache-Control header value
-            
-        Returns:
-            Dict[str, str]: Parsed cache control directives
-        """
+        """Parse Cache-Control header with improved handling."""
         directives = {}
         
         if not cache_control:
@@ -143,76 +196,67 @@ class CacheAnalyzer:
         for part in parts:
             if '=' in part:
                 key, value = part.split('=', 1)
-                directives[key.strip()] = value.strip()
+                directives[key.strip().lower()] = value.strip()
             else:
-                directives[part.strip()] = True
+                directives[part.strip().lower()] = True
                 
         return directives
 
     def _parse_vary_headers(self, vary: str) -> List[str]:
-        """
-        Parse Vary header into components.
-        
-        Args:
-            vary (str): Vary header value
-            
-        Returns:
-            List[str]: List of varying headers
-        """
+        """Parse Vary header with normalization."""
         if not vary:
             return []
             
-        return [h.strip() for h in vary.split(',')]
+        return [h.strip().lower() for h in vary.split(',')]
 
     def _is_response_cached(self, headers: Dict[str, str]) -> bool:
-        """
-        Determine if a response is cached based on headers.
-        
-        Args:
-            headers (Dict[str, str]): Response headers
-            
-        Returns:
-            bool: True if response appears to be cached
-        """
+        """Enhanced cache detection logic."""
         # Check explicit cache indicators
-        if 'X-Cache' in headers and 'HIT' in headers['X-Cache'].upper():
-            return True
+        cache_status = headers.get('X-Cache', '').upper()
+        if 'HIT' in cache_status or 'MISS' in cache_status:
+            return 'HIT' in cache_status
             
-        if 'CF-Cache-Status' in headers and 'HIT' in headers['CF-Cache-Status'].upper():
-            return True
+        cdn_status = headers.get('CF-Cache-Status', '').upper()
+        if cdn_status:
+            return cdn_status == 'HIT'
             
         # Check Cache-Control
-        cache_control = headers.get('Cache-Control', '')
-        if 'no-store' in cache_control or 'no-cache' in cache_control:
+        cache_control = self._parse_cache_control(headers.get('Cache-Control', ''))
+        if cache_control.get('no-store') or cache_control.get('no-cache'):
             return False
             
-        # Check for other caching indicators
-        if 'Age' in headers or 'ETag' in headers or 'Last-Modified' in headers:
+        # Check for caching indicators
+        if (
+            'Age' in headers or
+            'ETag' in headers or
+            'Last-Modified' in headers or
+            cache_control.get('max-age') or
+            cache_control.get('s-maxage')
+        ):
             return True
             
         return False
 
     def _calculate_ttl(self, headers: Dict[str, str]) -> Optional[int]:
-        """
-        Calculate Time-To-Live for cached content.
-        
-        Args:
-            headers (Dict[str, str]): Response headers
-            
-        Returns:
-            Optional[int]: TTL in seconds, or None if not determinable
-        """
+        """Calculate TTL with improved accuracy."""
         try:
-            # Check Cache-Control max-age
             cache_control = self._parse_cache_control(headers.get('Cache-Control', ''))
+            
+            # Check max-age and s-maxage
+            if 's-maxage' in cache_control:
+                return int(cache_control['s-maxage'])
             if 'max-age' in cache_control:
                 return int(cache_control['max-age'])
                 
-            # Check Expires header
-            if 'Expires' in headers:
-                expires = datetime.strptime(headers['Expires'], '%a, %d %b %Y %H:%M:%S %Z')
+            # Check Age and Expires headers
+            if 'Age' in headers and 'Expires' in headers:
+                age = int(headers['Age'])
+                expires = datetime.strptime(
+                    headers['Expires'],
+                    '%a, %d %b %Y %H:%M:%S %Z'
+                )
                 now = datetime.utcnow()
-                return int((expires - now).total_seconds())
+                return max(0, int((expires - now).total_seconds()) - age)
                 
             return None
             
@@ -221,122 +265,64 @@ class CacheAnalyzer:
             return None
 
     def _analyze_cache_key_components(self, headers: Dict[str, str]) -> List[str]:
-        """
-        Analyze which components are likely part of the cache key.
+        """Analyze cache key components with CDN detection."""
+        components = ['URL', 'Method']
         
-        Args:
-            headers (Dict[str, str]): Response headers
-            
-        Returns:
-            List[str]: List of probable cache key components
-        """
-        components = []
+        # Add Vary header components
+        vary_headers = self._parse_vary_headers(headers.get('Vary', ''))
+        if vary_headers:
+            components.extend(vary_headers)
         
-        # Check Vary header
-        vary = headers.get('Vary', '')
-        if vary:
-            components.extend(self._parse_vary_headers(vary))
-            
-        # Add common cache key components
-        components.extend([
-            'URL',
-            'Method',
-            'Protocol'
-        ])
-        
-        # Check for CDN-specific headers
-        if any(h.startswith(('CF-', 'X-Cache-')) for h in headers):
+        # Detect CDN-specific components
+        if any(k.startswith(('CF-', 'X-Cache-', 'Fastly-', 'Akamai-')) for k in headers):
             components.append('CDN-Specific')
             
-        return components
+        # Add cache control specific components
+        cache_control = self._parse_cache_control(headers.get('Cache-Control', ''))
+        if cache_control:
+            if cache_control.get('private'):
+                components.append('Private')
+            if cache_control.get('vary-by-cookie'):
+                components.append('Cookie')
+                
+        return list(set(components))  # Remove duplicates
 
-    async def _validate_cache_behavior(
+    async def _quick_cache_check(
         self,
         client: HTTPClient,
         url: str,
-        initial_headers: Dict[str, str]
-    ) -> None:
+        samples: int = 3
+    ) -> float:
         """
-        Perform additional tests to validate cache behavior.
+        Perform quick cache behavior check.
         
         Args:
             client (HTTPClient): HTTP client instance
             url (str): URL to test
-            initial_headers (Dict[str, str]): Headers from initial request
+            samples (int): Number of requests to make
+            
+        Returns:
+            float: Cache hit ratio
         """
         try:
-            # Test with different headers
-            variations = [
-                {'User-Agent': 'CacheTest/1.0'},
-                {'Accept': 'text/plain'},
-                {'Accept-Encoding': 'identity'}
-            ]
+            hits = 0
             
-            for headers in variations:
-                response = await client.get(url, headers=headers)
-                self._compare_cache_behavior(initial_headers, response.headers)
-                
-            # Test with rapid requests
-            await self._test_rapid_requests(client, url)
-            
-        except Exception as e:
-            logger.error(f"Cache validation failed: {str(e)}")
-
-    def _compare_cache_behavior(
-        self,
-        headers1: Dict[str, str],
-        headers2: Dict[str, str]
-    ) -> None:
-        """
-        Compare cache behavior between two responses.
-        
-        Args:
-            headers1 (Dict[str, str]): Headers from first response
-            headers2 (Dict[str, str]): Headers from second response
-        """
-        try:
-            # Compare cache indicators
-            cache1 = self._extract_cache_headers(headers1)
-            cache2 = self._extract_cache_headers(headers2)
-            
-            if cache1 != cache2:
-                logger.info("Different cache behavior detected between requests")
-                logger.debug(f"Cache1: {cache1}")
-                logger.debug(f"Cache2: {cache2}")
-                
-        except Exception as e:
-            logger.error(f"Error comparing cache behavior: {str(e)}")
-
-    async def _test_rapid_requests(self, client: HTTPClient, url: str) -> None:
-        """
-        Test cache behavior with rapid successive requests.
-        
-        Args:
-            client (HTTPClient): HTTP client instance
-            url (str): URL to test
-        """
-        try:
             # Make multiple rapid requests
-            responses = await asyncio.gather(
-                *[client.get(url) for _ in range(3)],
-                return_exceptions=True
-            )
-            
-            # Analyze responses
-            cache_hits = sum(
-                1 for r in responses
-                if isinstance(r, Exception) or self._is_response_cached(r.headers)
-            )
-            
-            if cache_hits > 0:
-                logger.info(f"Detected {cache_hits} cache hits in rapid requests")
+            for _ in range(samples):
+                response = await client.get(url, use_cache=False)
+                if self._is_response_cached(dict(response.headers)):
+                    hits += 1
+                await asyncio.sleep(0.1)  # Small delay between requests
                 
+            return hits / samples
+            
         except Exception as e:
-            logger.error(f"Error testing rapid requests: {str(e)}")
+            logger.error(f"Error in quick cache check: {str(e)}")
+            return 0.0
 
     def generate_cache_buster(self, url: str) -> str:
         """
-        Generate a cache-busting URL variation.
+        Generate an effective cache-busting URL.
         
         Args:
             url (str): Original URL
@@ -344,18 +330,25 @@ class CacheAnalyzer:
         Returns:
             str: URL with cache-busting parameter
         """
-        timestamp = int(time.time())
+        timestamp = int(time.time() * 1000)  # Millisecond precision
         random_component = hashlib.md5(str(timestamp).encode()).hexdigest()[:8]
         
         separator = '&' if '?' in url else '?'
-        return f"{url}{separator}_={timestamp}-{random_component}"
+        return f"{url}{separator}_cb={timestamp}-{random_component}"
 
 if __name__ == "__main__":
     # Test cache analyzer functionality
     async def test_analyzer():
         client = HTTPClient()
         analyzer = CacheAnalyzer()
-        result = await analyzer.analyze(client, "http://example.com")
-        print(f"Cache Analysis Result: {result}")
+        try:
+            result = await analyzer.analyze(client, "http://example.com")
+            print(f"Cache Analysis Result:")
+            print(f"Is Cached: {result.is_cached}")
+            print(f"TTL: {result.ttl}")
+            print(f"Cache Headers: {result.cache_headers}")
+            print(f"Cache Hit Ratio: {result.cache_hit_ratio}")
+        finally:
+            await client.close_all_sessions()
         
     asyncio.run(test_analyzer())
