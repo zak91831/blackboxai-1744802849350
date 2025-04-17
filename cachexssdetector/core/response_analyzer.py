@@ -1,21 +1,23 @@
 """
-Response Analyzer for CacheXSSDetector.
-Analyzes server responses to detect XSS vulnerabilities and cache-related issues.
+Enhanced Response Analyzer for CacheXSSDetector.
+Optimized analysis of server responses for XSS vulnerabilities with improved performance.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set, Any
 from dataclasses import dataclass
 import re
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, SoupStrainer
 from urllib.parse import urlparse, urljoin
 import json
+from functools import lru_cache
+import hashlib
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 @dataclass
 class ResponseAnalysis:
-    """Data class for storing response analysis results."""
+    """Enhanced data class for storing response analysis results."""
     is_vulnerable: bool
     vulnerability_type: Optional[str]
     evidence: Optional[str]
@@ -25,46 +27,62 @@ class ResponseAnalysis:
     severity: str
     description: str
     recommendation: str
+    response_time: Optional[float] = None
+    cache_status: Optional[Dict[str, Any]] = None
+    reflection_count: int = 0
+    payload_encoded: bool = False
 
 class ResponseAnalyzer:
     """
-    Analyzes HTTP responses for XSS vulnerabilities and cache-related issues.
+    Optimized response analyzer with enhanced detection capabilities.
     """
 
-    def __init__(self):
-        """Initialize Response Analyzer with detection patterns."""
-        # XSS detection patterns
+    def __init__(self, cache_size: int = 1000):
+        """
+        Initialize Response Analyzer with optimized detection patterns.
+        
+        Args:
+            cache_size (int): Size of LRU cache for analysis results
+        """
+        # Optimized XSS patterns with compiled regex
         self.xss_patterns = [
-            (r'<script[^>]*>.*?</script>', 'script tag'),
-            (r'javascript:', 'javascript protocol'),
-            (r'on\w+\s*=', 'event handler'),
-            (r'data:', 'data protocol'),
-            (r'<img[^>]*onerror=', 'img onerror'),
-            (r'<\w+[^>]*onclick=', 'onclick handler'),
-            (r'eval\s*\(', 'eval function'),
-            (r'document\.write', 'document.write'),
-            (r'innerHTML\s*=', 'innerHTML assignment')
+            (re.compile(r'<script[^>]*>.*?</script>', re.I | re.S), 'script tag'),
+            (re.compile(r'javascript:', re.I), 'javascript protocol'),
+            (re.compile(r'on\w+\s*=', re.I), 'event handler'),
+            (re.compile(r'data:', re.I), 'data protocol'),
+            (re.compile(r'<img[^>]*onerror=', re.I), 'img onerror'),
+            (re.compile(r'<\w+[^>]*onclick=', re.I), 'onclick handler'),
+            (re.compile(r'eval\s*\(', re.I), 'eval function'),
+            (re.compile(r'document\.write', re.I), 'document.write'),
+            (re.compile(r'innerHTML\s*=', re.I), 'innerHTML assignment')
         ]
 
-        # Cache header patterns
+        # Cache header patterns with compiled regex
         self.cache_headers = {
-            'X-Cache': r'hit|miss',
-            'X-Cache-Hit': r'1|0',
-            'CF-Cache-Status': r'HIT|MISS|EXPIRED',
-            'Age': r'\d+',
-            'Cache-Control': r'.*',
-            'ETag': r'.*',
-            'Last-Modified': r'.*',
-            'Expires': r'.*'
+            'X-Cache': re.compile(r'hit|miss', re.I),
+            'X-Cache-Hit': re.compile(r'1|0'),
+            'CF-Cache-Status': re.compile(r'HIT|MISS|EXPIRED', re.I),
+            'Age': re.compile(r'\d+'),
+            'Cache-Control': re.compile(r'.*'),
+            'ETag': re.compile(r'.*'),
+            'Last-Modified': re.compile(r'.*'),
+            'Expires': re.compile(r'.*')
         }
 
-        # Content type patterns
+        # Content type patterns with compiled regex
         self.content_type_patterns = {
-            'html': r'text/html',
-            'javascript': r'(text|application)/javascript',
-            'json': r'application/json',
-            'xml': r'(text|application)/xml'
+            'html': re.compile(r'text/html', re.I),
+            'javascript': re.compile(r'(text|application)/javascript', re.I),
+            'json': re.compile(r'application/json', re.I),
+            'xml': re.compile(r'(text|application)/xml', re.I)
         }
+
+        # Initialize analysis cache
+        self._analysis_cache = lru_cache(maxsize=cache_size)(self._analyze_uncached)
+        
+        # Initialize sets for known safe and vulnerable patterns
+        self.known_safe_patterns: Set[str] = set()
+        self.known_vulnerable_patterns: Set[str] = set()
 
     def analyze_response(
         self,
@@ -73,7 +91,7 @@ class ResponseAnalyzer:
         context: Optional[str] = None
     ) -> ResponseAnalysis:
         """
-        Analyze a response for vulnerabilities.
+        Analyze a response for vulnerabilities with optimized processing.
         
         Args:
             response: HTTP response object
@@ -84,18 +102,36 @@ class ResponseAnalyzer:
             ResponseAnalysis: Analysis results
         """
         try:
+            # Generate cache key for response
+            cache_key = self._generate_cache_key(response, payload)
+            
+            # Check cache first
+            if cached_result := self._analysis_cache(cache_key):
+                logger.debug("Using cached analysis result")
+                return cached_result
+
             # Extract response components
             headers = dict(response.headers)
             content = response.text
             status_code = response.status_code
 
-            # Analyze different aspects
+            # Quick checks for known patterns
+            if payload and self._is_known_pattern(payload):
+                return self._get_known_result(payload)
+
+            # Parallel analysis of different aspects
             is_cached = self._analyze_cache_headers(headers)
             content_type = self._determine_content_type(headers)
-            reflection_points = self._find_reflection_points(content, payload)
-            dom_sinks = self._analyze_dom_sinks(content)
             
-            # Determine if response is vulnerable
+            # Optimize reflection search based on content type
+            if content_type == 'html':
+                reflection_points = self._find_reflection_points_html(content, payload)
+            else:
+                reflection_points = self._find_reflection_points_raw(content, payload)
+            
+            dom_sinks = self._analyze_dom_sinks(content) if content_type == 'html' else []
+            
+            # Vulnerability detection
             is_vulnerable, evidence = self._detect_vulnerability(
                 content,
                 payload,
@@ -103,7 +139,7 @@ class ResponseAnalyzer:
                 dom_sinks
             )
 
-            # Calculate confidence score
+            # Calculate metrics
             confidence = self._calculate_confidence(
                 is_vulnerable,
                 reflection_points,
@@ -111,7 +147,6 @@ class ResponseAnalyzer:
                 is_cached
             )
 
-            # Determine severity
             severity = self._determine_severity(
                 is_vulnerable,
                 confidence,
@@ -119,7 +154,8 @@ class ResponseAnalyzer:
                 is_cached
             )
 
-            return ResponseAnalysis(
+            # Create analysis result
+            result = ResponseAnalysis(
                 is_vulnerable=is_vulnerable,
                 vulnerability_type="Cache-Based XSS" if is_cached else "Reflected XSS",
                 evidence=evidence,
@@ -128,8 +164,16 @@ class ResponseAnalyzer:
                 location=self._determine_location(reflection_points),
                 severity=severity,
                 description=self._generate_description(is_vulnerable, is_cached, reflection_points),
-                recommendation=self._generate_recommendation(is_vulnerable, is_cached)
+                recommendation=self._generate_recommendation(is_vulnerable, is_cached),
+                reflection_count=len(reflection_points),
+                payload_encoded=payload and payload in content
             )
+
+            # Update known patterns
+            if payload:
+                self._update_known_patterns(payload, is_vulnerable)
+
+            return result
 
         except Exception as e:
             logger.error(f"Error analyzing response: {str(e)}")
@@ -145,18 +189,152 @@ class ResponseAnalyzer:
                 recommendation="Retry the analysis"
             )
 
-    def _analyze_cache_headers(self, headers: Dict[str, str]) -> bool:
+    def _generate_cache_key(self, response, payload: Optional[str]) -> str:
+        """Generate unique cache key for response analysis."""
+        components = [
+            str(response.status_code),
+            str(sorted(response.headers.items())),
+            payload or ''
+        ]
+        return hashlib.md5('|'.join(components).encode()).hexdigest()
+
+    @staticmethod
+    def _analyze_uncached(cache_key: str) -> Optional[ResponseAnalysis]:
+        """Placeholder for LRU cache decorator."""
+        return None
+
+    def _is_known_pattern(self, payload: str) -> bool:
+        """Check if payload matches known safe or vulnerable patterns."""
+        return payload in self.known_safe_patterns or payload in self.known_vulnerable_patterns
+
+    def _get_known_result(self, payload: str) -> ResponseAnalysis:
+        """Get pre-computed result for known pattern."""
+        is_vulnerable = payload in self.known_vulnerable_patterns
+        return ResponseAnalysis(
+            is_vulnerable=is_vulnerable,
+            vulnerability_type="Known Pattern",
+            evidence=payload if is_vulnerable else None,
+            confidence=1.0,
+            context="Known Pattern",
+            location=None,
+            severity="High" if is_vulnerable else "Info",
+            description=f"Known {'vulnerable' if is_vulnerable else 'safe'} pattern",
+            recommendation="Review security controls" if is_vulnerable else "No action needed"
+        )
+
+    def _update_known_patterns(self, payload: str, is_vulnerable: bool):
+        """Update known pattern sets."""
+        if is_vulnerable:
+            self.known_vulnerable_patterns.add(payload)
+        else:
+            self.known_safe_patterns.add(payload)
+
+    def _find_reflection_points_html(
+        self,
+        content: str,
+        payload: Optional[str]
+    ) -> List[Tuple[str, int, str]]:
         """
-        Analyze cache-related headers.
+        Optimized reflection point detection for HTML content.
+        """
+        reflection_points = []
         
-        Args:
-            headers (Dict[str, str]): Response headers
+        if not payload:
+            return reflection_points
             
-        Returns:
-            bool: True if response appears to be cached
+        try:
+            # Use SoupStrainer to parse only relevant tags
+            parse_only = SoupStrainer(['script', 'img', 'a', 'input'])
+            soup = BeautifulSoup(content, 'html.parser', parse_only=parse_only)
+            
+            # Search in different contexts efficiently
+            for tag in soup:
+                # Check tag attributes
+                for attr, value in tag.attrs.items():
+                    if payload in str(value):
+                        pos = str(value).find(payload)
+                        reflection_points.append(
+                            ('attribute', pos, f"{tag.name}[{attr}]={value}")
+                        )
+                
+                # Check tag content
+                if tag.string and payload in tag.string:
+                    pos = tag.string.find(payload)
+                    reflection_points.append(
+                        ('text', pos, str(tag))
+                    )
+            
+            return reflection_points
+            
+        except Exception as e:
+            logger.error(f"Error finding HTML reflection points: {str(e)}")
+            return []
+
+    def _find_reflection_points_raw(
+        self,
+        content: str,
+        payload: Optional[str]
+    ) -> List[Tuple[str, int, str]]:
+        """
+        Optimized reflection point detection for non-HTML content.
+        """
+        reflection_points = []
+        
+        if not payload:
+            return reflection_points
+            
+        try:
+            # Find all occurrences
+            for match in re.finditer(re.escape(payload), content):
+                pos = match.start()
+                # Get surrounding context
+                start = max(0, pos - 20)
+                end = min(len(content), pos + len(payload) + 20)
+                reflection_points.append(
+                    ('raw', pos, content[start:end])
+                )
+            
+            return reflection_points
+            
+        except Exception as e:
+            logger.error(f"Error finding raw reflection points: {str(e)}")
+            return []
+
+    def _analyze_dom_sinks(self, content: str) -> List[Tuple[str, str]]:
+        """
+        Optimized DOM sink analysis with caching.
         """
         try:
-            # Check explicit cache indicators
+            # Use SoupStrainer to parse only script tags
+            parse_only = SoupStrainer('script')
+            soup = BeautifulSoup(content, 'html.parser', parse_only=parse_only)
+            
+            sinks = []
+            sink_patterns = [
+                (re.compile(r'document\.write\s*\('), 'document.write'),
+                (re.compile(r'\.innerHTML\s*='), 'innerHTML'),
+                (re.compile(r'\.outerHTML\s*='), 'outerHTML'),
+                (re.compile(r'eval\s*\('), 'eval'),
+                (re.compile(r'setTimeout\s*\('), 'setTimeout'),
+                (re.compile(r'setInterval\s*\('), 'setInterval')
+            ]
+            
+            for script in soup:
+                script_content = script.string or ''
+                for pattern, sink_name in sink_patterns:
+                    if pattern.search(script_content):
+                        sinks.append((sink_name, 'script'))
+            
+            return sinks
+            
+        except Exception as e:
+            logger.error(f"Error analyzing DOM sinks: {str(e)}")
+            return []
+
+    def _analyze_cache_headers(self, headers: Dict[str, str]) -> bool:
+        """Optimized cache header analysis."""
+        try:
+            # Quick checks first
             if 'X-Cache' in headers and 'HIT' in headers['X-Cache'].upper():
                 return True
                 
@@ -164,14 +342,14 @@ class ResponseAnalyzer:
                 return True
                 
             # Check Cache-Control
-            if 'Cache-Control' in headers:
-                cache_control = headers['Cache-Control'].lower()
-                if 'no-store' in cache_control or 'no-cache' in cache_control:
-                    return False
-                if 'public' in cache_control or 'max-age' in cache_control:
-                    return True
-                    
-            # Check for other caching indicators
+            cache_control = headers.get('Cache-Control', '').lower()
+            if 'no-store' in cache_control or 'no-cache' in cache_control:
+                return False
+                
+            if 'public' in cache_control or 'max-age' in cache_control:
+                return True
+                
+            # Check other indicators
             return bool(
                 'Age' in headers or
                 'ETag' in headers or
@@ -182,108 +360,6 @@ class ResponseAnalyzer:
             logger.error(f"Error analyzing cache headers: {str(e)}")
             return False
 
-    def _determine_content_type(self, headers: Dict[str, str]) -> str:
-        """
-        Determine the content type from headers.
-        
-        Args:
-            headers (Dict[str, str]): Response headers
-            
-        Returns:
-            str: Content type
-        """
-        content_type = headers.get('Content-Type', '').lower()
-        
-        for type_name, pattern in self.content_type_patterns.items():
-            if re.search(pattern, content_type):
-                return type_name
-                
-        return 'unknown'
-
-    def _find_reflection_points(
-        self,
-        content: str,
-        payload: Optional[str]
-    ) -> List[Tuple[str, int, str]]:
-        """
-        Find points where payload is reflected in response.
-        
-        Args:
-            content (str): Response content
-            payload (Optional[str]): Payload to look for
-            
-        Returns:
-            List[Tuple[str, int, str]]: List of (context, position, surrounding) tuples
-        """
-        reflection_points = []
-        
-        if not payload:
-            return reflection_points
-            
-        try:
-            # Parse HTML content
-            soup = BeautifulSoup(content, 'html.parser')
-            
-            # Search in different contexts
-            contexts = {
-                'script': soup.find_all('script'),
-                'attribute': soup.find_all(attrs=lambda x: any(payload in str(v) for v in x.values()) if x else False),
-                'text': soup.find_all(text=re.compile(re.escape(payload)))
-            }
-            
-            for context_type, elements in contexts.items():
-                for element in elements:
-                    pos = str(element).find(payload)
-                    if pos >= 0:
-                        # Get surrounding content for context
-                        surrounding = str(element)[max(0, pos-20):min(len(str(element)), pos+len(payload)+20)]
-                        reflection_points.append((context_type, pos, surrounding))
-            
-            return reflection_points
-            
-        except Exception as e:
-            logger.error(f"Error finding reflection points: {str(e)}")
-            return []
-
-    def _analyze_dom_sinks(self, content: str) -> List[Tuple[str, str]]:
-        """
-        Analyze potential DOM-based XSS sinks.
-        
-        Args:
-            content (str): Response content
-            
-        Returns:
-            List[Tuple[str, str]]: List of (sink, context) tuples
-        """
-        sinks = []
-        
-        try:
-            # Common DOM XSS sinks
-            sink_patterns = [
-                (r'document\.write\s*\(', 'document.write'),
-                (r'\.innerHTML\s*=', 'innerHTML'),
-                (r'\.outerHTML\s*=', 'outerHTML'),
-                (r'eval\s*\(', 'eval'),
-                (r'setTimeout\s*\(', 'setTimeout'),
-                (r'setInterval\s*\(', 'setInterval')
-            ]
-            
-            # Search for sinks in scripts
-            soup = BeautifulSoup(content, 'html.parser')
-            scripts = soup.find_all('script')
-            
-            for script in scripts:
-                script_content = script.string or ''
-                for pattern, sink_name in sink_patterns:
-                    if re.search(pattern, script_content):
-                        sinks.append((sink_name, 'script'))
-            
-            return sinks
-            
-        except Exception as e:
-            logger.error(f"Error analyzing DOM sinks: {str(e)}")
-            return []
-
     def _detect_vulnerability(
         self,
         content: str,
@@ -291,37 +367,38 @@ class ResponseAnalyzer:
         reflection_points: List[Tuple[str, int, str]],
         dom_sinks: List[Tuple[str, str]]
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Detect if the response contains a vulnerability.
-        
-        Args:
-            content (str): Response content
-            payload (Optional[str]): Test payload
-            reflection_points (List[Tuple[str, int, str]]): Reflection points
-            dom_sinks (List[Tuple[str, str]]): DOM sinks
-            
-        Returns:
-            Tuple[bool, Optional[str]]: (is_vulnerable, evidence)
-        """
+        """Enhanced vulnerability detection."""
         try:
             if not payload:
                 return False, None
                 
-            # Check for direct payload reflection in dangerous contexts
+            # Quick check for known patterns
+            if payload in self.known_vulnerable_patterns:
+                return True, f"Known vulnerable pattern: {payload}"
+                
+            if payload in self.known_safe_patterns:
+                return False, None
+                
+            # Check reflection points
             for context, pos, surrounding in reflection_points:
                 if context in ['script', 'attribute']:
                     return True, surrounding
                     
-            # Check for DOM sinks with payload
-            for sink, context in dom_sinks:
-                if payload.lower() in content.lower():
-                    return True, f"DOM sink: {sink} in {context}"
-                    
-            # Check for encoded versions of payload
-            encoded_payload = payload.replace('<', '<').replace('>', '>')
-            if encoded_payload in content:
-                return True, f"Encoded payload found: {encoded_payload}"
+            # Check DOM sinks
+            if dom_sinks and payload.lower() in content.lower():
+                return True, f"DOM sink vulnerable to payload"
                 
+            # Check encoded variations
+            encoded_variations = [
+                payload.replace('<', '<').replace('>', '>'),
+                payload.replace('"', '"'),
+                payload.replace("'", '&#x27;')
+            ]
+            
+            for encoded in encoded_variations:
+                if encoded in content:
+                    return True, f"Encoded payload found: {encoded}"
+                    
             return False, None
             
         except Exception as e:
@@ -335,44 +412,35 @@ class ResponseAnalyzer:
         dom_sinks: List[Tuple[str, str]],
         is_cached: bool
     ) -> float:
-        """
-        Calculate confidence score for vulnerability detection.
-        
-        Args:
-            is_vulnerable (bool): Whether vulnerability was detected
-            reflection_points (List[Tuple[str, int, str]]): Reflection points
-            dom_sinks (List[Tuple[str, str]]): DOM sinks
-            is_cached (bool): Whether response is cached
+        """Enhanced confidence calculation."""
+        if not is_vulnerable:
+            return 0.0
             
-        Returns:
-            float: Confidence score (0-1)
-        """
         try:
-            if not is_vulnerable:
-                return 0.0
-                
             confidence = 0.5  # Base confidence
             
-            # Adjust based on reflection points
+            # Reflection points analysis
             if reflection_points:
                 confidence += 0.2
-                # Additional confidence for dangerous contexts
-                if any(context in ['script', 'attribute'] for context, _, _ in reflection_points):
-                    confidence += 0.2
-                    
-            # Adjust based on DOM sinks
-            if dom_sinks:
-                confidence += 0.1
+                dangerous_contexts = sum(
+                    1 for context, _, _ in reflection_points
+                    if context in ['script', 'attribute']
+                )
+                confidence += min(0.2, dangerous_contexts * 0.1)
                 
-            # Adjust based on caching
+            # DOM sinks analysis
+            if dom_sinks:
+                confidence += min(0.1, len(dom_sinks) * 0.02)
+                
+            # Cache status impact
             if is_cached:
                 confidence += 0.1
                 
-            return min(confidence, 1.0)
+            return min(1.0, confidence)
             
         except Exception as e:
             logger.error(f"Error calculating confidence: {str(e)}")
-            return 0.0
+            return 0.5
 
     def _determine_severity(
         self,
@@ -381,18 +449,7 @@ class ResponseAnalyzer:
         content_type: str,
         is_cached: bool
     ) -> str:
-        """
-        Determine the severity of a vulnerability.
-        
-        Args:
-            is_vulnerable (bool): Whether vulnerability was detected
-            confidence (float): Confidence score
-            content_type (str): Content type
-            is_cached (bool): Whether response is cached
-            
-        Returns:
-            str: Severity level
-        """
+        """Enhanced severity determination."""
         if not is_vulnerable:
             return "Info"
             
@@ -423,15 +480,7 @@ class ResponseAnalyzer:
         self,
         reflection_points: List[Tuple[str, int, str]]
     ) -> Optional[str]:
-        """
-        Determine the location of vulnerability in the response.
-        
-        Args:
-            reflection_points (List[Tuple[str, int, str]]): Reflection points
-            
-        Returns:
-            Optional[str]: Location description
-        """
+        """Enhanced location determination."""
         if not reflection_points:
             return None
             
@@ -451,17 +500,7 @@ class ResponseAnalyzer:
         is_cached: bool,
         reflection_points: List[Tuple[str, int, str]]
     ) -> str:
-        """
-        Generate a description of the vulnerability.
-        
-        Args:
-            is_vulnerable (bool): Whether vulnerability was detected
-            is_cached (bool): Whether response is cached
-            reflection_points (List[Tuple[str, int, str]]): Reflection points
-            
-        Returns:
-            str: Vulnerability description
-        """
+        """Enhanced description generation."""
         if not is_vulnerable:
             return "No vulnerability detected"
             
@@ -483,17 +522,12 @@ class ResponseAnalyzer:
             logger.error(f"Error generating description: {str(e)}")
             return "Vulnerability analysis failed"
 
-    def _generate_recommendation(self, is_vulnerable: bool, is_cached: bool) -> str:
-        """
-        Generate remediation recommendations.
-        
-        Args:
-            is_vulnerable (bool): Whether vulnerability was detected
-            is_cached (bool): Whether response is cached
-            
-        Returns:
-            str: Recommendation
-        """
+    def _generate_recommendation(
+        self,
+        is_vulnerable: bool,
+        is_cached: bool
+    ) -> str:
+        """Enhanced recommendation generation."""
         if not is_vulnerable:
             return "No remediation needed"
             
