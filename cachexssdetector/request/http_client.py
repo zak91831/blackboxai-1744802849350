@@ -203,12 +203,12 @@ class HTTPClient:
         if headers:
             request_headers.update(headers)
 
-            # Check cache if enabled
-            if use_cache and method.upper() == 'GET':
-                cache_key = self._generate_cache_key(method, url, request_headers)
-                if cached_response := self._get_cached_response(cache_key):
-                    logger.debug(f"Cache hit for {url}")
-                    return cached_response
+        # Check cache if enabled
+        if use_cache and method.upper() == 'GET':
+            cache_key = self._generate_cache_key(method, url, request_headers)
+            if cached_response := self._get_cached_response(cache_key):
+                logger.debug(f"Cache hit for {url}")
+                return cached_response
 
         # Configure proxy if specified
         proxy_settings = {}
