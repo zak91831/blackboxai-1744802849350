@@ -61,7 +61,8 @@ class Scanner:
         proxy: Optional[str] = None,
         verbose: bool = False,
         max_concurrent_scans: int = 10,
-        max_urls_per_scan: int = 100
+        max_urls_per_scan: int = 100,
+        requests_per_second: float = 10.0
     ):
         """
         Initialize scanner with enhanced configuration.
@@ -102,7 +103,10 @@ class Scanner:
         self.failed_requests = 0
         self.error_counts: Dict[str, int] = {}
         self.scan_semaphore = asyncio.Semaphore(max_concurrent_scans)
+        self.rate_limit_semaphore = asyncio.Semaphore(1)
         self.scanned_urls: Set[str] = set()
+        self.last_request_time = 0.0
+        self.min_request_interval = 1.0 / requests_per_second
         
         # Performance metrics
         self.response_times: List[float] = []
@@ -134,12 +138,20 @@ class Scanner:
         
         try:
             async with self.scan_semaphore:
-                # Analyze cache behavior first
-                start_time = time.time()
-                cache_info = await self.cache_analyzer.analyze(
-                    self.http_client,
-                    url
-                )
+                # Rate limiting
+                async with self.rate_limit_semaphore:
+                    current_time = time.time()
+                    time_since_last_request = current_time - self.last_request_time
+                    if time_since_last_request < self.min_request_interval:
+                        await asyncio.sleep(self.min_request_interval - time_since_last_request)
+                    self.last_request_time = time.time()
+                    
+                    # Analyze cache behavior first
+                    start_time = time.time()
+                    cache_info = await self.cache_analyzer.analyze(
+                        self.http_client,
+                        url
+                    )
                 self.total_requests += 1
                 self.successful_requests += 1
                 response_time = time.time() - start_time
@@ -158,25 +170,46 @@ class Scanner:
                 
                 for payload in payloads:
                     try:
-                        start_time = time.time()
-                        response = await self.http_client.get(
-                            url,
-                            headers={'X-Cache-Test': payload}
-                        )
-                        response_time = time.time() - start_time
-                        self.response_times.append(response_time)
+                        # Retry logic with exponential backoff
+                        max_retries = 3
+                        retry_delay = 1
+                        for retry in range(max_retries):
+                            try:
+                                start_time = time.time()
+                                # Rate limiting
+                                async with self.rate_limit_semaphore:
+                                    current_time = time.time()
+                                    time_since_last_request = current_time - self.last_request_time
+                                    if time_since_last_request < self.min_request_interval:
+                                        await asyncio.sleep(self.min_request_interval - time_since_last_request)
+                                    self.last_request_time = time.time()
+                                    
+                                    response = await self.http_client.get(
+                                        url,
+                                        headers={'X-Cache-Test': payload}
+                                    )
+                                response_time = time.time() - start_time
+                                self.response_times.append(response_time)
+                                break
+                            except Exception as e:
+                                if retry == max_retries - 1:
+                                    raise
+                                logger.warning(f"Retry {retry + 1}/{max_retries} for {url}: {str(e)}")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
                         
-                        self.total_requests += 1
+                        self.total_requests += retry + 1
                         self.successful_requests += 1
                         
-                        if self.response_analyzer.is_vulnerable(response, payload):
+                        analysis = await self.response_analyzer.analyze_response(response, payload)
+                        if analysis.is_vulnerable:
                             vuln = Vulnerability(
                                 type="Cache-Based XSS",
                                 url=url,
-                                description="Cache-based XSS vulnerability detected",
-                                severity="High",
+                                description=analysis.description,
+                                severity=analysis.severity,
                                 payload=payload,
-                                evidence=self.response_analyzer.get_evidence(response),
+                                evidence=analysis.evidence,
                                 response_time=response_time,
                                 cache_info=cache_info.to_dict()
                             )
@@ -197,9 +230,13 @@ class Scanner:
             
         return vulnerabilities
 
-    async def run_async(self) -> ScanResult:
+    async def run_async(self, progress_callback: Optional[callable] = None) -> ScanResult:
         """
-        Run the scanner asynchronously with parallel processing.
+        Run the scanner asynchronously with parallel processing and progress reporting.
+        
+        Args:
+            progress_callback: Optional callback function to report progress
+                             Signature: callback(current: int, total: int, message: str)
         
         Returns:
             ScanResult: Detailed results of the scan
@@ -210,26 +247,37 @@ class Scanner:
         try:
             # Generate URL variations efficiently
             urls_to_scan = self.url_manipulator.generate_variations(self.url)
-            logger.info(f"Generated {len(urls_to_scan)} URLs to scan")
+            total_urls = min(len(urls_to_scan), self.max_urls_per_scan)
+            logger.info(f"Generated {total_urls} URLs to scan")
+            
+            if progress_callback:
+                progress_callback(0, total_urls, "Starting scan...")
             
             # Create tasks for parallel scanning
             tasks = []
             for url in urls_to_scan[:self.max_urls_per_scan]:
                 tasks.append(self.scan_url(url))
             
-            # Run tasks concurrently
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Process results
-            for result in results:
-                if isinstance(result, list):
-                    self.vulnerabilities.extend(result)
-                else:
-                    logger.error(f"Task failed: {str(result)}")
+            # Run tasks concurrently with progress tracking
+            completed = 0
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    result = await coro
+                    if isinstance(result, list):
+                        self.vulnerabilities.extend(result)
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(
+                            completed,
+                            total_urls,
+                            f"Scanned {completed}/{total_urls} URLs. Found {len(self.vulnerabilities)} vulnerabilities."
+                        )
+                except Exception as e:
+                    logger.error(f"Task failed: {str(e)}")
                     self.failed_requests += 1
-                    error_type = type(result).__name__
+                    error_type = type(e).__name__
                     self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
-                
+
         except Exception as e:
             logger.error(f"Scan failed: {str(e)}")
             raise
@@ -263,14 +311,18 @@ class Scanner:
             performance_metrics=performance_metrics
         )
 
-    def run(self) -> ScanResult:
+    def run(self, progress_callback: Optional[callable] = None) -> ScanResult:
         """
-        Run the scanner synchronously.
+        Run the scanner synchronously with progress reporting.
+        
+        Args:
+            progress_callback: Optional callback function to report progress
+                             Signature: callback(current: int, total: int, message: str)
         
         Returns:
             ScanResult: Results of the scan
         """
-        return asyncio.run(self.run_async())
+        return asyncio.run(self.run_async(progress_callback))
 
     def save_report(self, output_path: str) -> None:
         """
