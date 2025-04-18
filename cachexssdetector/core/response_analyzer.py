@@ -84,7 +84,7 @@ class ResponseAnalyzer:
         self.known_safe_patterns: Set[str] = set()
         self.known_vulnerable_patterns: Set[str] = set()
 
-    def analyze_response(
+    async def analyze_response(
         self,
         response,
         payload: Optional[str] = None,
@@ -112,8 +112,8 @@ class ResponseAnalyzer:
 
             # Extract response components
             headers = dict(response.headers)
-            content = response.text
-            status_code = response.status_code
+            content = await response.text()
+            status_code = response.status
 
             # Quick checks for known patterns
             if payload and self._is_known_pattern(payload):
@@ -186,13 +186,17 @@ class ResponseAnalyzer:
                 location=None,
                 severity="Info",
                 description="Analysis failed due to error",
-                recommendation="Retry the analysis"
+                recommendation="Retry the analysis",
+                response_time=None,
+                cache_status=None,
+                reflection_count=0,
+                payload_encoded=False
             )
 
     def _generate_cache_key(self, response, payload: Optional[str]) -> str:
         """Generate unique cache key for response analysis."""
         components = [
-            str(response.status_code),
+            str(response.status),
             str(sorted(response.headers.items())),
             payload or ''
         ]
@@ -330,6 +334,21 @@ class ResponseAnalyzer:
         except Exception as e:
             logger.error(f"Error analyzing DOM sinks: {str(e)}")
             return []
+
+    def _determine_content_type(self, headers: Dict[str, str]) -> str:
+        """Determine content type from headers."""
+        content_type = headers.get('Content-Type', '').lower()
+        
+        if 'text/html' in content_type:
+            return 'html'
+        elif 'application/json' in content_type:
+            return 'json'
+        elif 'text/javascript' in content_type or 'application/javascript' in content_type:
+            return 'javascript'
+        elif 'text/xml' in content_type or 'application/xml' in content_type:
+            return 'xml'
+        else:
+            return 'raw'
 
     def _analyze_cache_headers(self, headers: Dict[str, str]) -> bool:
         """Optimized cache header analysis."""
